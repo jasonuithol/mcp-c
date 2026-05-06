@@ -17,10 +17,11 @@ Two services are registered. Use them — don't reinvent.
   source, and accumulated test-failure / fix / sanitizer history.
   **Query this before writing non-trivial code.** Cross-project retrieval
   is the point.
-- **c-build** (`build`, `run_tests`, `lint`, `analyze`) — gcc 13 / clang
+- **c-build** (`build`, `run_tests`, `lint`, `analyze`, `install_dep`,
+  `install_dep_source`, `remove_dep`, `list_deps`) — gcc 13 / clang
   toolchain with cmake, meson, make, valgrind, clang-tidy, cppcheck,
-  AddressSanitizer. `build` auto-detects the build system. Test,
-  lint, and analyze failures auto-ingest into c-knowledge.
+  AddressSanitizer. `build` auto-detects the build system. Test, lint,
+  and analyze failures auto-ingest into c-knowledge.
 
 Detail: `/workspace/docs/C_MCP.md`, `/workspace/docs/INGEST_MCP.md`.
 
@@ -61,8 +62,40 @@ Detail: `/workspace/docs/C_BASICS.md`, `/workspace/docs/C_GOTCHAS.md`.
   TUI session.
 - No process-control service. Long-running daemons aren't a normal C
   build artefact in this sandbox.
-- No package/install tooling. Distribution model (deb, tarball, etc.) is
-  per-project — no MCP surface yet.
+
+## Project dependencies
+
+Project libraries live in `<project>/deps/{include,lib,lib/pkgconfig}`.
+The build/test/lint/analyze tools auto-add those paths to `CPATH`,
+`LIBRARY_PATH`, `LD_LIBRARY_PATH`, and `PKG_CONFIG_PATH` — your build
+files don't need to know about `deps/` at all, just `-lyaml` /
+`pkg-config --libs yaml-0.1` like normal.
+
+Two ways to populate it:
+
+- **`install_dep(project, packages)`** — for libraries that exist in
+  Debian bookworm. Pass dev + runtime packages, e.g.
+  `install_dep("ChessGen", ["libyaml-dev", "libyaml-0-2"])`. Extracts
+  the .debs straight into `deps/` (no compilation, ABI is correct by
+  construction). This is the fast path — prefer it.
+- **`install_dep_source(project, name, url, sha256, configure_args, build_system, arch)`**
+  — for libraries not in bookworm, or HEAD/custom versions. Builds
+  inside the c-build container so binaries are ABI-compatible. Auto-
+  detects autotools / cmake / meson / make from the tarball; override
+  with `build_system=...` if it guesses wrong.
+
+`list_deps(project)` shows the current manifest (version, arch, file
+count per entry). `remove_dep(project, packages)` clears the manifest
+entry and deletes its files, **except files still claimed by another
+entry** — shared files survive until the last claimant is removed.
+Each install records the complete file list it would contribute
+(derived from staging / `DESTDIR`), so this works correctly for
+`libyaml-dev`/`libyaml-0-2`-style overlapping packages. The `arch` parameter on
+all four install/remove tools defaults to `"native"`; only `"native"`
+and `"amd64"` are accepted right now since the c-build image ships
+only the native amd64 toolchain. The c-build container itself only
+carries the toolchain — don't ask for libraries to be added to its
+Dockerfile.
 
 ## Per-project context
 
