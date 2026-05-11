@@ -29,6 +29,9 @@ runs accumulate as retrievable context.
 - **`knowledge/CLAUDE.md`** — design doc for the knowledge service
   (chunking strategy, ingest routing, metadata schema, known concerns).
 - **`service/mcp-service.py`** — the build/test/lint/analyze tools.
+- **`service/seccomp/`** — bundled seccomp profiles for the c-build
+  container; today just `tsan.json` (allow-all). Loaded via
+  `$SECCOMP_PROFILE` in `service/start-container.sh`; see conventions.
 - **`knowledge/mcp-service.py`** — the FastMCP query server + `/ingest`
   HTTP endpoint.
 
@@ -65,3 +68,32 @@ runs accumulate as retrievable context.
   cross-compile arches, bake the `crossbuild-essential-<arch>` packages
   into `service/Dockerfile` and extend `_SUPPORTED_ARCHES` /
   `_DEB_TO_MULTIARCH` in `service/mcp-service.py`.
+- **Optional seccomp profile:** `service/start-container.sh` honours
+  `$SECCOMP_PROFILE`. Unset → runtime default applies. Set + readable →
+  passed as `--security-opt seccomp=…`. One profile per container —
+  swapping requires `docker rm -f c-mcp-build` then re-`./start.sh` (a
+  revived container ignores the new value, since seccomp is bound at
+  creation). Use the bundled `service/seccomp/tsan.json` (allow-all) for
+  `analyze(tool="tsan")` work; drop project-specific profiles wherever
+  convenient (e.g. `~/Projects/<project>/.seccomp.json`) for other
+  scenarios that need extra syscalls (kernel-driver dev, BPF, etc.).
+- **TSan mitigation stack:** `analyze(tool="tsan")` for cmake projects
+  applies four overlapping fixes — strip any one and TSan starts flaking
+  with "unexpected memory mapping". Don't simplify without understanding
+  why each layer is there:
+  1. `-DCMAKE_POSITION_INDEPENDENT_CODE=OFF` on configure — stops cmake
+     emitting `-pie` per-target (which would override our `-no-pie` due
+     to link-line ordering). Shared libs stay PIC regardless; cmake
+     forces it for `SHARED`/`MODULE` targets.
+  2. `-no-pie` in `CMAKE_EXE_LINKER_FLAGS` — defends against projects
+     that hardcode `-pie` via `target_link_options`.
+  3. `setarch <arch> -R` wrapping the `ctest` invocation — sets
+     `ADDR_NO_RANDOMIZE`, inherited by every test child. Required even
+     with non-PIE binaries because the dynamic loader's library
+     placement is what collides with TSan's shadow range.
+  4. Relaxed seccomp profile (above) — `setarch` needs `personality()`,
+     which the runtime default filters with ENOSYS.
+
+  The meson path uses `-Db_pie=false` instead of (1) + (2), and the
+  same `setarch` wrapper. Direct-compile uses the `setarch` wrapper on
+  each `build-tsan/test_*` invocation.
