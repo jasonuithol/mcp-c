@@ -47,10 +47,17 @@ Detail: `/workspace/docs/C_MCP.md`, `/workspace/docs/INGEST_MCP.md`.
    - `handle_segv=0` so a genuine SIGSEGV in the test exits cleanly with
      `rc=139` instead of getting stuck in libasan's recursive
      DEADLYSIGNAL handler. Tradeoff: no ASan-printed stack on signal
-     crashes — debug those under gdb. Heap-overflow / use-after-free /
-     leak reports are unaffected (those don't go through the signal
-     handler).
+     crashes — call `debug(project, test)` to get a gdb backtrace for any
+     specific crash. Heap-overflow / use-after-free / leak reports are
+     unaffected (those don't go through the signal handler).
    See `/workspace/docs/C_MCP.md` for the full rationale.
+
+   **For betl specifically**, prefer `analyze(tool="valgrind")` as the
+   primary memory-checker: valgrind instruments dynamically so it covers
+   allocations through provider libs (libpq, libfreetds, libodbc,
+   libyaml) that ASan can't see in this codebase. Reserve `analyze(asan)`
+   for the provider-free unit tests via `scope=`. Run `debug(test)` for
+   stack traces on any specific crash, ASan or not.
 6. **For data races / lock-discipline bugs, run `analyze(tool="tsan")`.**
    Rebuilds the project under `-fsanitize=thread,undefined` into
    `build-tsan/` and runs the resulting tests with `TSAN_OPTIONS` /

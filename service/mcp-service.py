@@ -603,10 +603,14 @@ async def _enumerate_meson_tests(pd: Path, build_dir: str, env: dict | None) -> 
 mcp = FastMCP(
     name="c-build",
     instructions=(
-        "Tools for building, testing, linting, and analysing C projects. "
+        "Tools for building, testing, linting, analysing, and debugging C projects. "
         "build auto-detects CMakeLists.txt → cmake, meson.build → meson, "
         "Makefile → make, otherwise compiles *.c directly with gcc. "
-        "Test, lint, and analyze failures are reported to c-knowledge."
+        "analyze(asan) finds memory bugs in instrumented project code but "
+        "uses handle_segv=0 to avoid DEADLYSIGNAL loops, so crashes give "
+        "rc=139 with no stack — use debug(test) to get a gdb backtrace for "
+        "any single test. Test, lint, analyze, and debug failures are "
+        "reported to c-knowledge."
     ),
 )
 
@@ -1768,6 +1772,196 @@ def _patch_pc_files(pc_dir: Path, deps_root: Path, multiarch: str) -> None:
             flags=re.MULTILINE,
         )
         pc.write_text(text)
+
+
+# ── debug ─────────────────────────────────────────────────────────────────────
+
+@mcp.tool()
+async def debug(
+    project: str,
+    test: str,
+    build_dir: str = "build",
+) -> str:
+    """
+    Run a single test (or binary) under gdb --batch and capture a backtrace.
+
+    Use this when a test exits with a fatal signal (rc=139/SIGSEGV,
+    rc=134/SIGABRT, rc=136/SIGFPE, ...) and you want to know where it
+    crashed, not just that it did. This is the complement to
+    analyze(tool="asan"): with handle_segv=0, ASan-mode crashes give you
+    only a return code; debug() gives you the stack.
+
+    Args:
+        project: Folder name under ~/Projects (no path separators).
+        test: Either a ctest test name (matched exactly against the
+              build_dir's ctest enumeration) or a path to a binary
+              relative to <project>/<build_dir>/.
+        build_dir: Which build directory under <project>/ to use.
+                   Default "build". Common choices:
+                     - "build": normal build, fastest, best for project code.
+                     - "build-asan": ASan-instrumented; gdb intercepts the
+                       fatal signal before libasan's handler, so you get a
+                       real backtrace where analyze(asan) would just exit
+                       rc=-11. ASAN_OPTIONS is auto-injected (matching
+                       analyze()'s settings) so the binary can start.
+                     - "build-tsan": same idea for TSan, with the setarch
+                       wrapper applied to disable ASLR.
+
+    The test runs under: gdb --batch with `handle SIGPIPE nostop`, `run`,
+    `bt full`, `info registers`, `thread apply all bt`, `quit`. If the
+    test exits cleanly (no crash this run), the backtrace will be empty —
+    teardown-time flakes are non-deterministic, so try a couple of times.
+
+    Forensic artifacts go to <project>/.forensics/debug/ (heartbeat,
+    output, snapshots — same shape as analyze()). The returned text is
+    the gdb session's combined stdout/stderr.
+    """
+    try:
+        pd = _project_dir(project)
+    except Exception as e:
+        result = f"DEBUG FAILED\n\n{e}"
+        _report("debug", {"project": project, "test": test, "build_dir": build_dir}, result, False)
+        return result
+
+    bd = pd / build_dir
+    if not bd.is_dir():
+        result = (
+            f"DEBUG FAILED\n\nbuild_dir {build_dir!r} does not exist under "
+            f"{project}. Run build (or analyze) first to populate it."
+        )
+        _report("debug", {"project": project, "test": test, "build_dir": build_dir}, result, False)
+        return result
+
+    deps_env = _deps_env(pd) or {}
+    san_env: dict[str, str] = {}
+    wrapper: list[str] = []
+    # If this is a sanitizer build dir, inject the same options analyze()
+    # uses so the binary can initialise. gdb intercepts signals before
+    # libasan/libtsan, so the backtrace is gdb's, not the sanitizer's.
+    # Override detect_leaks=0: LSan refuses to run under ptrace and
+    # aborts at exit ("LeakSanitizer has encountered a fatal error" +
+    # "LeakSanitizer does not work under ptrace"), which masks the real
+    # crash signal we're trying to investigate.
+    if "asan" in build_dir:
+        san_env.update(ASAN_RUN_ENV)
+        san_env["ASAN_OPTIONS"] = san_env["ASAN_OPTIONS"].replace(
+            "detect_leaks=1", "detect_leaks=0",
+        )
+    elif "tsan" in build_dir:
+        san_env.update(TSAN_RUN_ENV)
+        wrapper = list(TSAN_RUN_WRAPPER)
+
+    # Resolve `test` → (command, cwd, per-test env).
+    test_cmd: list[str] | None = None
+    test_cwd: str = str(pd)
+    test_env_kv: dict[str, str] = {}
+
+    if (bd / "CTestTestfile.cmake").exists():
+        meta = await _enumerate_ctest_tests(pd, build_dir, deps_env or None)
+        match = next((t for t in meta if t["name"] == test), None)
+        if match:
+            test_cmd = list(match["command"])
+            test_cwd = match["cwd"]
+            test_env_kv = match["env"]
+
+    if test_cmd is None:
+        candidate = bd / test
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            test_cmd = [str(candidate)]
+        else:
+            result = (
+                f"DEBUG FAILED\n\nTest {test!r} not found in ctest enumeration "
+                f"of {build_dir}, and {candidate} is not an executable file."
+            )
+            _report("debug", {"project": project, "test": test, "build_dir": build_dir}, result, False)
+            return result
+
+    test_env = {**deps_env, **san_env, **test_env_kv}
+
+    gdb_cmd = [
+        *wrapper,
+        "gdb", "--batch", "--quiet",
+        "-ex", "set pagination off",
+        "-ex", "set print frame-arguments all",
+        "-ex", "set print pretty on",
+        "-ex", "handle SIGPIPE nostop noprint pass",
+        "-ex", "run",
+        "-ex", "bt full",
+        "-ex", "info registers",
+        "-ex", "thread apply all bt",
+        "-ex", "quit",
+        "--args", *test_cmd,
+    ]
+
+    recorder = _ForensicsRecorder(pd, "debug")
+    forensic_name = test.replace("/", "_")
+    run_result = await _run_one_test_with_forensics(
+        gdb_cmd, test_cwd, test_env, forensic_name, recorder,
+    )
+
+    rc = run_result["rc"]
+    killed = run_result["kill_reason"]
+    elapsed = run_result["elapsed_ms"]
+    captured = run_result["captured"]
+
+    # gdb --batch's own exit code is 0 even when the inferior crashed,
+    # because gdb's job is to *report* on the inferior. We have to scrape
+    # the captured output to know whether the inferior actually crashed.
+    inferior_signal_match = re.search(
+        r"Program received signal (SIG\w+),?\s*([^\n.]*)", captured,
+    )
+    inferior_exit_match = re.search(
+        r"\[Inferior \d+ \(process \d+\) exited (normally|with code \d+)\]",
+        captured,
+    )
+
+    if killed:
+        header = (
+            f"DEBUG ✗ {test!r}: debug-tool timeout fired "
+            f"({killed} after {elapsed}ms — increase MCP_C_TEST_TIMEOUT_S "
+            f"or pick a faster test)"
+        )
+        overall_ok = False
+    elif inferior_signal_match:
+        signo = inferior_signal_match.group(1)
+        descr = inferior_signal_match.group(2).strip(" ,.")
+        suffix = f" ({descr})" if descr else ""
+        header = (
+            f"DEBUG ✗ {test!r}: inferior crashed with {signo}{suffix} "
+            f"after {elapsed}ms — backtrace below"
+        )
+        overall_ok = False
+    elif inferior_exit_match and "normally" not in inferior_exit_match.group(1):
+        header = (
+            f"DEBUG ⚠ {test!r}: inferior exited non-zero "
+            f"({inferior_exit_match.group(1)}) after {elapsed}ms — no signal, "
+            f"the backtrace will be empty"
+        )
+        overall_ok = False
+    elif rc == 0:
+        header = (
+            f"DEBUG ✓ {test!r}: exited cleanly under gdb after {elapsed}ms "
+            f"(no crash to investigate this run)"
+        )
+        overall_ok = True
+    else:
+        # gdb itself failed (couldn't load the binary, etc).
+        if rc < 0:
+            signal_note = f" (gdb killed by signal {-rc})"
+        elif rc > 128:
+            signal_note = f" (gdb likely killed by signal {rc - 128})"
+        else:
+            signal_note = ""
+        header = f"DEBUG ✗ {test!r}: gdb itself exited rc={rc}{signal_note} after {elapsed}ms"
+        overall_ok = False
+
+    log = (
+        f"{header}\n\n"
+        f"{_artifacts_section(recorder)}\n"
+        f"--- gdb session ---\n{captured}"
+    )
+    _report("debug", {"project": project, "test": test, "build_dir": build_dir}, log, overall_ok)
+    return log
 
 
 # ── install_dep ───────────────────────────────────────────────────────────────
