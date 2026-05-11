@@ -12,15 +12,19 @@ Register with Claude Code (run this inside the claude-sandbox-core container):
 from __future__ import annotations
 
 import asyncio
+import datetime
 import hashlib
 import json
 import os
 import platform
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 from pathlib import Path
 
 from fastmcp import FastMCP
@@ -37,9 +41,38 @@ LDFLAGS = os.environ.get("LDFLAGS", "")
 
 # Sanitizer flags used by analyze(tool="asan").
 ASAN_CFLAGS = "-fsanitize=address,undefined -fno-omit-frame-pointer -g -O1"
+# ASAN_OPTIONS rationale:
+#   abort_on_error=1, halt_on_error=1: when ASan detects a non-signal
+#     error (heap overflow, use-after-free, etc.), abort immediately
+#     instead of trying to continue.
+#   handle_segv=0: do NOT install ASan's SIGSEGV handler. When a test
+#     genuinely crashes with a fatal signal, libasan's handler tries to
+#     print a backtrace, the backtrace walk itself faults inside libasan,
+#     the handler re-fires (libasan uses SA_NODEFER), and we get an
+#     infinite "ASan:DEADLYSIGNAL" loop that produces multi-million-line
+#     log files until our 60s SIGABRT timeout fires (whose coredump frame
+#     is libasan's re-entered handler, not the original fault). With
+#     handle_segv=0 the kernel handles the signal: test exits cleanly
+#     with rc=139 (SIGSEGV) or rc=134 (SIGABRT), no log-spam, no useless
+#     libasan-frame coredumps. Tradeoff: no ASan-printed stack on signal
+#     crashes — debug those under gdb. Non-signal ASan reports (heap
+#     overflows, leaks, UB) are unaffected.
+#   detect_leaks=1: enable LSan at process exit.
+#   verify_asan_link_order=0: skip the runtime check that aborts with
+#     "ASan runtime does not come first in initial library list" when
+#     the instrumented binary dlopens (or transitively links) provider/
+#     plugin .so files that aren't asan-instrumented. ASan still works
+#     for the project's own code; it just can't track allocations made
+#     by libs loaded before libasan (libpq, libfreetds, libyaml, ...).
+#
+# An earlier attempt to fix the ordering check via LD_PRELOAD=libasan.so
+# caused libasan to be double-initialised (since the binary's DT_NEEDED
+# also references libasan), which corrupted its state and produced the
+# same DEADLYSIGNAL loop. verify_asan_link_order=0 is the supported
+# workaround; LD_PRELOAD is not.
 ASAN_RUN_ENV = {
-    "ASAN_OPTIONS": "abort_on_error=0:halt_on_error=0:detect_leaks=1",
-    "UBSAN_OPTIONS": "print_stacktrace=1:halt_on_error=0",
+    "ASAN_OPTIONS": "abort_on_error=1:halt_on_error=1:detect_leaks=1:verify_asan_link_order=0:handle_segv=0",
+    "UBSAN_OPTIONS": "print_stacktrace=1:halt_on_error=1",
 }
 
 # Sanitizer flags used by analyze(tool="tsan"). Thread + UB sanitizer, no -O level
@@ -61,6 +94,27 @@ TSAN_RUN_ENV = {
 # $SECCOMP_PROFILE pointing at service/seccomp/tsan.json (or a project-specific
 # profile) to relax that.
 TSAN_RUN_WRAPPER = ["setarch", platform.machine(), "-R"]
+
+# ── Forensics config ─────────────────────────────────────────────────────────
+# Per-test wall-clock timeout used by analyze() runs. On timeout, the test's
+# process group is sent SIGABRT (so ASan/TSan can dump state to the captured
+# output log) and SIGKILL after a short grace period.
+TEST_TIMEOUT_S = float(os.environ.get("MCP_C_TEST_TIMEOUT_S", "60"))
+TEST_ABORT_GRACE_S = float(os.environ.get("MCP_C_TEST_ABORT_GRACE_S", "5"))
+
+# Forensic artifacts (heartbeat, fsync'd live output, pre/post system
+# snapshots) land under <project>/<FORENSICS_DIRNAME>/<tool>/ so they are:
+#   - host-visible (the project dir is bind-mounted in from the host),
+#   - per-project (no cross-talk between betl/foo/bar runs),
+#   - resilient to a kernel-level wedge (each write is fsync'd),
+#   - resilient to container teardown (artifacts persist on the host FS).
+#
+# Items NOT recorded here because they require host-side tooling unavailable
+# inside the container:
+#   - post-reboot kernel ring (journalctl -k -b -1) — requires host journald
+#   - container event tap (podman events) — requires the docker socket
+# Run those manually on the host after a wedge; they survive the reboot.
+FORENSICS_DIRNAME = ".forensics"
 
 # ── Knowledge reporter ────────────────────────────────────────────────────────
 
@@ -179,6 +233,347 @@ def _write_manifest(pd: Path, manifest: dict) -> None:
     deps = _deps_root(pd)
     deps.mkdir(parents=True, exist_ok=True)
     (deps / DEPS_MANIFEST_NAME).write_text(json.dumps(manifest, indent=2, sort_keys=True))
+
+
+# ── Forensics: heartbeat, fsync'd tee, snapshots, timeouts ───────────────────
+
+
+def _iso_now() -> str:
+    """UTC ISO-8601 with microseconds, for heartbeat lines."""
+    return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
+
+def _safe_name(s: str) -> str:
+    """Make a test name safe for a path component."""
+    return re.sub(r"[^A-Za-z0-9._-]+", "_", s) or "unnamed"
+
+
+def _capture_snapshot() -> dict:
+    """One-shot view of process/memory pressure. Cheap; called pre + post test."""
+    snap: dict = {"timestamp": _iso_now()}
+
+    meminfo: dict[str, str] = {}
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                k, _, v = line.partition(":")
+                k = k.strip()
+                if k in ("MemTotal", "MemFree", "MemAvailable", "SwapTotal", "SwapFree"):
+                    meminfo[k] = v.strip()
+    except Exception as e:
+        meminfo["error"] = str(e)
+    snap["meminfo"] = meminfo
+
+    try:
+        snap["loadavg"] = Path("/proc/loadavg").read_text().strip()
+    except Exception as e:
+        snap["loadavg"] = f"error: {e}"
+
+    try:
+        snap["proc_count"] = sum(1 for p in Path("/proc").iterdir() if p.name.isdigit())
+    except Exception as e:
+        snap["proc_count"] = f"error: {e}"
+
+    # cgroup v2: bookworm + rootless podman → unified hierarchy at /sys/fs/cgroup.
+    cgroup: dict[str, str] = {}
+    for key in ("memory.current", "memory.max", "memory.swap.current",
+                "pids.current", "pids.max"):
+        try:
+            cgroup[key] = Path(f"/sys/fs/cgroup/{key}").read_text().strip()
+        except Exception:
+            pass
+    snap["cgroup"] = cgroup
+
+    return snap
+
+
+class _ForensicsRecorder:
+    """
+    Per-analyze artifact recorder. Writes to <pd>/<FORENSICS_DIRNAME>/<tool>/:
+      heartbeat.log   — START/END line per test, fsync'd before the next step
+      output/<n>.log  — live, unbuffered, fsync'd stdout+stderr capture
+      snapshots/<n>.{before,after}.json — meminfo/loadavg/cgroup snapshots
+
+    Each invocation wipes the prior run's directory so the artifacts always
+    describe the most recent analyze() call.
+    """
+
+    def __init__(self, pd: Path, tool: str):
+        self.root = pd / FORENSICS_DIRNAME / tool
+        if self.root.exists():
+            shutil.rmtree(self.root, ignore_errors=True)
+        self.output_dir = self.root / "output"
+        self.snapshots_dir = self.root / "snapshots"
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.snapshots_dir.mkdir(parents=True, exist_ok=True)
+        self.heartbeat = self.root / "heartbeat.log"
+        # Create + fsync an empty heartbeat so its directory entry is on disk
+        # before the first test starts.
+        with open(self.heartbeat, "wb") as f:
+            os.fsync(f.fileno())
+
+    def _fsync_append(self, path: Path, text: str) -> None:
+        with open(path, "ab", buffering=0) as f:
+            f.write(text.encode("utf-8"))
+            os.fsync(f.fileno())
+
+    def heartbeat_start(self, test_name: str, pid: int) -> None:
+        self._fsync_append(
+            self.heartbeat,
+            f"START {_iso_now()} {test_name} pid={pid}\n",
+        )
+
+    def heartbeat_end(
+        self,
+        test_name: str,
+        rc: int | None,
+        elapsed_ms: int,
+        killed: str | None,
+    ) -> None:
+        rc_s = "-" if rc is None else str(rc)
+        killed_s = killed or "-"
+        self._fsync_append(
+            self.heartbeat,
+            f"END {_iso_now()} {test_name} rc={rc_s} elapsed_ms={elapsed_ms} killed={killed_s}\n",
+        )
+
+    def snapshot(self, test_name: str, when: str) -> None:
+        snap = _capture_snapshot()
+        path = self.snapshots_dir / f"{_safe_name(test_name)}.{when}.json"
+        path.write_text(json.dumps(snap, indent=2))
+
+    def output_path(self, test_name: str) -> Path:
+        return self.output_dir / f"{_safe_name(test_name)}.log"
+
+    def artifacts(self) -> dict[str, str]:
+        return {
+            "heartbeat": str(self.heartbeat),
+            "output_dir": str(self.output_dir),
+            "snapshots_dir": str(self.snapshots_dir),
+        }
+
+
+def _artifacts_section(recorder: _ForensicsRecorder) -> str:
+    a = recorder.artifacts()
+    return (
+        "Forensic artifacts (if the host wedges mid-run, look here first):\n"
+        f"  heartbeat:      {a['heartbeat']}\n"
+        f"  output dir:     {a['output_dir']}\n"
+        f"  snapshots dir:  {a['snapshots_dir']}\n"
+    )
+
+
+def _run_with_forensics(
+    cmd: list[str],
+    cwd: str,
+    env: dict | None,
+    output_log: Path,
+    timeout_s: float = TEST_TIMEOUT_S,
+    abort_grace_s: float = TEST_ABORT_GRACE_S,
+    on_start=None,
+) -> dict:
+    """
+    Run cmd in its own session, tee combined stdout+stderr to output_log with
+    fsync after every chunk, and enforce a wall-clock timeout that escalates
+    SIGABRT → wait → SIGKILL on the process group.
+
+    The new session means killpg() reaches the whole subtree (e.g. setarch
+    → stdbuf → ctest → test_binary all die together).
+
+    on_start, if given, is called with the spawned pid right after Popen —
+    used by the caller to write the heartbeat START line with the real pid.
+
+    Returns dict: {rc, captured, pid, elapsed_ms, kill_reason, success}.
+    """
+    full_env = os.environ.copy()
+    if env:
+        full_env.update(env)
+
+    proc = subprocess.Popen(
+        cmd,
+        cwd=cwd,
+        env=full_env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        start_new_session=True,
+    )
+    if on_start is not None:
+        try:
+            on_start(proc.pid)
+        except Exception:
+            pass
+
+    captured = bytearray()
+    out_f = open(output_log, "wb", buffering=0)
+
+    def _reader():
+        # read1 returns whatever is immediately available; loop until EOF.
+        while True:
+            try:
+                chunk = proc.stdout.read1(4096)
+            except (ValueError, OSError):
+                return
+            if not chunk:
+                return
+            captured.extend(chunk)
+            try:
+                out_f.write(chunk)
+                os.fsync(out_f.fileno())
+            except Exception:
+                # Filesystem hiccup — keep capturing in memory so we don't
+                # lose what's in the pipe.
+                pass
+
+    t = threading.Thread(target=_reader, daemon=True)
+    t.start()
+
+    start = time.monotonic()
+    kill_reason: str | None = None
+    abort_at: float | None = None
+
+    while True:
+        rc = proc.poll()
+        if rc is not None:
+            break
+        now = time.monotonic()
+        if kill_reason is None and (now - start) >= timeout_s:
+            kill_reason = "SIGABRT"
+            abort_at = now
+            try:
+                os.killpg(proc.pid, signal.SIGABRT)
+            except ProcessLookupError:
+                pass
+        elif (kill_reason == "SIGABRT"
+              and abort_at is not None
+              and (now - abort_at) >= abort_grace_s):
+            kill_reason = "SIGKILL"
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        time.sleep(0.1)
+
+    # Drain the pipe — give the reader a moment to flush the last chunks.
+    t.join(timeout=5.0)
+    try:
+        out_f.close()
+    except Exception:
+        pass
+
+    elapsed_ms = int((time.monotonic() - start) * 1000)
+    rc = proc.returncode
+    success = rc == 0 and kill_reason is None
+    return {
+        "rc": rc,
+        "captured": captured.decode("utf-8", errors="replace"),
+        "pid": proc.pid,
+        "elapsed_ms": elapsed_ms,
+        "kill_reason": kill_reason,
+        "success": success,
+    }
+
+
+async def _run_one_test_with_forensics(
+    cmd: list[str],
+    cwd: str,
+    env: dict | None,
+    test_name: str,
+    recorder: _ForensicsRecorder,
+) -> dict:
+    """Wrap _run_with_forensics with the per-test forensics protocol:
+    pre-snapshot → heartbeat START (with real pid) → run → heartbeat END →
+    post-snapshot.
+    """
+    recorder.snapshot(test_name, "before")
+
+    def _on_start(pid: int) -> None:
+        recorder.heartbeat_start(test_name, pid)
+
+    result = await asyncio.to_thread(
+        _run_with_forensics,
+        cmd,
+        cwd,
+        env,
+        recorder.output_path(test_name),
+        TEST_TIMEOUT_S,
+        TEST_ABORT_GRACE_S,
+        _on_start,
+    )
+    recorder.heartbeat_end(
+        test_name,
+        rc=result["rc"],
+        elapsed_ms=result["elapsed_ms"],
+        killed=result["kill_reason"],
+    )
+    recorder.snapshot(test_name, "after")
+    return result
+
+
+async def _enumerate_ctest_tests(pd: Path, build_dir: str, env: dict | None) -> list[dict]:
+    """
+    Return per-test metadata via ctest's --show-only=json-v1, as a list of
+    dicts: {"name": str, "command": list[str], "cwd": str, "env": dict[str,str]}.
+
+    We use the json-v1 surface (not `ctest -N`) so we get the actual test
+    binary path and can execute it directly, bypassing ctest at run time.
+    That isolation matters because ctest is not sanitizer-instrumented;
+    pass deps_env only here (no sanitizer env) so an accidental future
+    LD_PRELOAD or aggressive ASAN_OPTIONS setting can't crash ctest itself.
+    """
+    ok, out = await _run_async(
+        ["ctest", "--test-dir", build_dir, "--show-only=json-v1"],
+        cwd=str(pd),
+        env=env,
+    )
+    if not ok:
+        return []
+    try:
+        data = json.loads(out)
+    except Exception:
+        return []
+    tests: list[dict] = []
+    for t in data.get("tests", []):
+        name = t.get("name")
+        command = t.get("command") or []
+        if not name or not command:
+            continue
+        cwd = str(pd)
+        env_kv: dict[str, str] = {}
+        for p in t.get("properties", []):
+            pn = p.get("name")
+            pv = p.get("value")
+            if pn == "WORKING_DIRECTORY" and isinstance(pv, str):
+                cwd = pv
+            elif pn == "ENVIRONMENT" and pv:
+                items = pv if isinstance(pv, list) else [pv]
+                for item in items:
+                    if isinstance(item, str) and "=" in item:
+                        k, _, v = item.partition("=")
+                        env_kv[k] = v
+        tests.append({
+            "name": name,
+            "command": list(command),
+            "cwd": cwd,
+            "env": env_kv,
+        })
+    return tests
+
+
+async def _enumerate_meson_tests(pd: Path, build_dir: str, env: dict | None) -> list[str]:
+    """Return meson's known test names."""
+    _ok, out = await _run_async(
+        ["meson", "test", "-C", build_dir, "--list"],
+        cwd=str(pd),
+        env=env,
+    )
+    names: list[str] = []
+    for line in out.splitlines():
+        s = line.strip()
+        if not s:
+            continue
+        # meson can prefix lines with "suite / name"; take the last segment.
+        names.append(s.split("/")[-1].strip())
+    return names
 
 
 # ── MCP server ────────────────────────────────────────────────────────────────
@@ -446,7 +841,7 @@ def _fail_no_build(tool: str, project: str, test_filter: str = "") -> str:
 
 def _gather_lint_targets(pd: Path) -> list[Path]:
     """All .c and .h under the project, skipping build directories."""
-    skip_parts = {"build", "build-make", ".git", "node_modules"}
+    skip_parts = {"build", "build-make", ".git", "node_modules", FORENSICS_DIRNAME}
     out = []
     for ext in ("*.c", "*.h"):
         for p in pd.rglob(ext):
@@ -516,7 +911,7 @@ async def lint(project: str) -> str:
 # ── analyze ───────────────────────────────────────────────────────────────────
 
 @mcp.tool()
-async def analyze(project: str, tool: str = "valgrind") -> str:
+async def analyze(project: str, tool: str = "valgrind", scope: str = "") -> str:
     """
     Run dynamic analysis on the project's test binaries.
 
@@ -533,6 +928,10 @@ async def analyze(project: str, tool: str = "valgrind") -> str:
                     the sanitizer, compiles, then runs meson test.
           - make:   not supported (Makefiles vary too much to inject
                     sanitizer flags reliably; set CFLAGS in your Makefile).
+
+        Test runs set ASAN_OPTIONS=verify_asan_link_order=0 so tests that
+        dlopen non-instrumented provider/plugin .so files don't fail with
+        "ASan runtime does not come first in initial library list".
 
     tool="tsan": same backend matrix as asan, but with
         -fsanitize=thread,undefined and TSAN_OPTIONS/UBSAN_OPTIONS set to
@@ -551,45 +950,79 @@ async def analyze(project: str, tool: str = "valgrind") -> str:
         Symptom of forgetting this step: every test fails with
         "setarch: failed to set personality" in the test output.
 
+    Forensics. Every analyze() run records, under
+    <project>/.forensics/<tool>/:
+        heartbeat.log           — fsync'd START/END line per test, so if
+                                  the host wedges mid-run the file shows
+                                  exactly which test was in flight.
+        output/<test>.log       — live, line-flushed, fsync'd capture of
+                                  combined stdout+stderr (so output past
+                                  the last flush isn't lost).
+        snapshots/<test>.before.json, <test>.after.json
+                                — meminfo / loadavg / proc count / cgroup
+                                  memory.{current,max} and pids.{current,max}
+                                  before and after each test.
+    Tests are run one at a time under sanitizer modes (serial = the brief's
+    "ctest --jobs 1 under sanitizers" item). Each test has a wall-clock
+    timeout of MCP_C_TEST_TIMEOUT_S seconds (default 60); on timeout the
+    test's process group is sent SIGABRT (letting ASan/TSan dump state to
+    output/<test>.log) and SIGKILL after a grace period.
+
+    Items the brief asks for that need host-side tooling and so are NOT
+    captured by this service (do them by hand after a wedge):
+      - post-reboot kernel ring (journalctl -k -b -1)
+      - container event tap     (podman events --format json)
+
     Args:
         project: Folder name under ~/Projects.
         tool:    'valgrind', 'asan', or 'tsan'.
+        scope:   Optional test name filter. For ctest it's matched as a
+                 regex against test names (same as `ctest -R`). For meson,
+                 matched as a substring of the test name. For direct-compile
+                 and valgrind, matched as a substring of the binary basename.
+                 Use this to sanitize-run a single test without rebuilding.
     """
     try:
         pd = _project_dir(project)
     except Exception as e:
         result = f"ANALYZE FAILED\n\n{e}"
-        _report("analyze", {"project": project, "tool": tool}, result, False)
+        _report("analyze", {"project": project, "tool": tool, "scope": scope}, result, False)
         return result
 
     if tool == "valgrind":
-        return await _analyze_valgrind(project, pd)
+        return await _analyze_valgrind(project, pd, scope)
     if tool == "asan":
-        return await _analyze_asan(project, pd)
+        return await _analyze_asan(project, pd, scope)
     if tool == "tsan":
-        return await _analyze_tsan(project, pd)
+        return await _analyze_tsan(project, pd, scope)
     result = f"ANALYZE FAILED ✗\n\nUnknown tool {tool!r}. Use 'valgrind', 'asan', or 'tsan'."
-    _report("analyze", {"project": project, "tool": tool}, result, False)
+    _report("analyze", {"project": project, "tool": tool, "scope": scope}, result, False)
     return result
 
 
-async def _analyze_valgrind(project: str, pd: Path) -> str:
+async def _analyze_valgrind(project: str, pd: Path, scope: str = "") -> str:
     bins = _gather_test_binaries(pd)
+    if scope:
+        bins = [b for b in bins if scope in b.name]
     if not bins:
         result = (
             "ANALYZE FAILED ✗\n\n"
             "No build*/test_* binaries to analyse. Run build() and run_tests() first."
+            + (f"\nNote: scope={scope!r} filtered all binaries out." if scope else "")
         )
-        _report("analyze", {"project": project, "tool": "valgrind"}, result, False)
+        _report("analyze", {"project": project, "tool": "valgrind", "scope": scope}, result, False)
         return result
 
     deps_env = _deps_env(pd) or None
+    recorder = _ForensicsRecorder(pd, "valgrind")
     sections: list[str] = []
     findings: list[dict] = []
     overall_ok = True
 
     for b in bins:
+        name = b.name
         cmd = [
+            "stdbuf", "-o0", "-e0",
             "valgrind",
             "--leak-check=full",
             "--show-leak-kinds=all",
@@ -597,9 +1030,21 @@ async def _analyze_valgrind(project: str, pd: Path) -> str:
             "--error-exitcode=23",
             str(b),
         ]
-        ok, out = await _run_async(cmd, cwd=str(pd), env=deps_env)
-        sections.append(f"-- {b.relative_to(pd)} ({'clean' if ok else 'errors'}) --\n{out}")
-        findings.append({"node_id": b.name, "passed": ok})
+        result = await _run_one_test_with_forensics(
+            cmd, str(pd), deps_env, name, recorder,
+        )
+        ok = result["success"]
+        out = result["captured"]
+        timeout_note = ""
+        if result["kill_reason"]:
+            timeout_note = (
+                f" [{result['kill_reason']} after {result['elapsed_ms']}ms]"
+            )
+            ok = False
+        sections.append(
+            f"-- {b.relative_to(pd)} ({'clean' if ok else 'errors'}){timeout_note} --\n{out}"
+        )
+        findings.append({"node_id": name, "passed": ok})
         overall_ok = overall_ok and ok
 
     log = "\n\n".join(sections)
@@ -609,21 +1054,26 @@ async def _analyze_valgrind(project: str, pd: Path) -> str:
         f"clean={sum(1 for f in findings if f['passed'])} "
         f"with_errors={sum(1 for f in findings if not f['passed'])}"
     )
+    if scope:
+        summary += f" scope={scope!r}"
+
+    artifacts = _artifacts_section(recorder)
 
     ingest_payload = json.dumps({
         "summary": f"{header}\n{summary}",
         "findings": findings,
         "stdout": log[-12000:],
+        "artifacts": recorder.artifacts(),
     })
     _report(
         "analyze",
-        {"project": project, "tool": "valgrind"},
+        {"project": project, "tool": "valgrind", "scope": scope},
         ingest_payload,
         overall_ok,
     )
 
     tail = log[-2500:]
-    return f"{header}\n\n{summary}\n\n--- valgrind output (tail) ---\n{tail}"
+    return f"{header}\n\n{summary}\n\n{artifacts}\n--- valgrind output (tail) ---\n{tail}"
 
 
 async def _analyze_sanitizer_cmake(
@@ -635,6 +1085,7 @@ async def _analyze_sanitizer_cmake(
     exe_link_extra: str = "",
     extra_defines: list[str] | None = None,
     test_wrapper: list[str] | None = None,
+    scope: str = "",
 ) -> str:
     """Configure build-{tool}/ with sanitizer flags injected via CMAKE_C_FLAGS,
     build, then run ctest with the sanitizer's runtime env vars set.
@@ -676,34 +1127,92 @@ async def _analyze_sanitizer_cmake(
     sections.append(f"-- cmake build ({'ok' if ok else 'failed'}) --\n{out}")
     if not ok:
         result = f"ANALYZE FAILED ✗\n\n" + "\n\n".join(sections)
-        _report("analyze", {"project": project, "tool": tool}, result, False)
+        _report("analyze", {"project": project, "tool": tool, "scope": scope}, result, False)
         return result
 
-    run_env = {**(deps_env or {}), **san_env}
-    ctest_cmd = [
-        *(test_wrapper or []),
-        "ctest", "--test-dir", build_dir, "--output-on-failure",
-    ]
-    ok, out = await _run_async(ctest_cmd, cwd=str(pd), env=run_env)
-    sections.append(f"-- ctest ({'clean' if ok else 'errors'}) --\n{out}")
-    findings = _parse_ctest(out) or [{"node_id": f"ctest-{tool}", "passed": ok}]
+    # Enumerate with deps_env only; ctest itself isn't sanitizer-instrumented
+    # and is kept out of the san_env scope for safety even though we no longer
+    # LD_PRELOAD libasan (see ASAN_RUN_ENV docstring for history).
+    tests_meta = await _enumerate_ctest_tests(pd, build_dir, deps_env)
+    if scope:
+        try:
+            rx = re.compile(scope)
+        except re.error:
+            rx = re.compile(re.escape(scope))
+        tests_meta = [t for t in tests_meta if rx.search(t["name"])]
+
+    recorder = _ForensicsRecorder(pd, tool)
+    findings: list[dict] = []
+    overall_ok = True
+
+    if not tests_meta:
+        # Fall back to a one-shot ctest run if json-v1 returned nothing
+        # (project with non-ctest tests, an older cmake, or an empty
+        # filter).
+        if scope:
+            msg = f"(no ctest tests matched scope={scope!r})"
+        else:
+            msg = "(ctest --show-only=json-v1 returned no tests; running a single ctest pass)"
+        sections.append(f"-- ctest enumerate --\n{msg}\n")
+        if not scope:
+            fallback_env = {**(deps_env or {}), **san_env}
+            fallback_cmd = [
+                *(test_wrapper or []),
+                "ctest", "--test-dir", build_dir, "--output-on-failure",
+            ]
+            ok, out = await _run_async(fallback_cmd, cwd=str(pd), env=fallback_env)
+            sections.append(f"-- ctest ({'clean' if ok else 'errors'}) --\n{out}")
+            findings = _parse_ctest(out) or [{"node_id": f"ctest-{tool}", "passed": ok}]
+            overall_ok = ok
+    else:
+        # Run each test's binary directly (bypassing ctest at execution).
+        # Per-test ENVIRONMENT properties (from add_test) get merged in.
+        base_run_env = {**(deps_env or {}), **san_env}
+        for t in tests_meta:
+            name = t["name"]
+            test_env = {**base_run_env, **t["env"]}
+            cmd = [
+                *(test_wrapper or []),
+                "stdbuf", "-o0", "-e0",
+                *t["command"],
+            ]
+            result = await _run_one_test_with_forensics(
+                cmd, t["cwd"], test_env, name, recorder,
+            )
+            ok = result["success"]
+            timeout_note = ""
+            if result["kill_reason"]:
+                timeout_note = f" [{result['kill_reason']} after {result['elapsed_ms']}ms]"
+                ok = False
+            sections.append(
+                f"-- test {name} ({'clean' if ok else 'errors'}){timeout_note} --\n"
+                f"{result['captured']}"
+            )
+            findings.append({"node_id": name, "passed": ok})
+            overall_ok = overall_ok and ok
 
     log = "\n\n".join(sections)
-    header = "ANALYZE CLEAN ✓" if ok else "ANALYZE FOUND ISSUES ✗"
+    header = "ANALYZE CLEAN ✓" if overall_ok else "ANALYZE FOUND ISSUES ✗"
     summary = (
         f"tool={tool} backend=cmake build_dir={build_dir} "
         f"tests={len(findings)} "
         f"clean={sum(1 for f in findings if f['passed'])} "
         f"with_errors={sum(1 for f in findings if not f['passed'])}"
     )
+    if scope:
+        summary += f" scope={scope!r}"
+
+    artifacts = _artifacts_section(recorder)
+
     ingest_payload = json.dumps({
         "summary": f"{header}\n{summary}",
         "findings": findings,
         "stdout": log[-12000:],
+        "artifacts": recorder.artifacts(),
     })
-    _report("analyze", {"project": project, "tool": tool}, ingest_payload, ok)
+    _report("analyze", {"project": project, "tool": tool, "scope": scope}, ingest_payload, overall_ok)
     tail = log[-2500:]
-    return f"{header}\n\n{summary}\n\n--- {tool} output (tail) ---\n{tail}"
+    return f"{header}\n\n{summary}\n\n{artifacts}\n--- {tool} output (tail) ---\n{tail}"
 
 
 async def _analyze_sanitizer_meson(
@@ -714,6 +1223,7 @@ async def _analyze_sanitizer_meson(
     san_env: dict[str, str],
     extra_setup_args: list[str] | None = None,
     test_wrapper: list[str] | None = None,
+    scope: str = "",
 ) -> str:
     """Set up build-{tool}/ with sanitizer flags injected via c_args/c_link_args
     (meson's b_sanitize accepts only a fixed set of values, so the explicit
@@ -749,59 +1259,106 @@ async def _analyze_sanitizer_meson(
     sections.append(f"-- meson compile ({'ok' if ok else 'failed'}) --\n{out}")
     if not ok:
         result = f"ANALYZE FAILED ✗\n\n" + "\n\n".join(sections)
-        _report("analyze", {"project": project, "tool": tool}, result, False)
+        _report("analyze", {"project": project, "tool": tool, "scope": scope}, result, False)
         return result
 
     run_env = {**(deps_env or {}), **san_env}
-    test_cmd = [
-        *(test_wrapper or []),
-        "meson", "test", "-C", build_dir, "--print-errorlogs",
-    ]
-    ok, out = await _run_async(test_cmd, cwd=str(pd), env=run_env)
-    sections.append(f"-- meson test ({'clean' if ok else 'errors'}) --\n{out}")
-    findings = _parse_meson(pd, build_dir) or [{"node_id": f"meson-test-{tool}", "passed": ok}]
+
+    test_names = await _enumerate_meson_tests(pd, build_dir, run_env)
+    if scope:
+        test_names = [n for n in test_names if scope in n]
+
+    recorder = _ForensicsRecorder(pd, tool)
+    findings: list[dict] = []
+    overall_ok = True
+
+    if not test_names:
+        msg = (
+            f"(no meson tests matched scope={scope!r})"
+            if scope
+            else "(meson test --list returned no tests; running a single meson test pass)"
+        )
+        sections.append(f"-- meson enumerate --\n{msg}\n")
+        if not scope:
+            fallback_cmd = [
+                *(test_wrapper or []),
+                "meson", "test", "-C", build_dir, "--print-errorlogs",
+            ]
+            ok, out = await _run_async(fallback_cmd, cwd=str(pd), env=run_env)
+            sections.append(f"-- meson test ({'clean' if ok else 'errors'}) --\n{out}")
+            findings = _parse_meson(pd, build_dir) or [
+                {"node_id": f"meson-test-{tool}", "passed": ok}
+            ]
+            overall_ok = ok
+    else:
+        for name in test_names:
+            cmd = [
+                *(test_wrapper or []),
+                "stdbuf", "-o0", "-e0",
+                "meson", "test", "-C", build_dir, "--verbose", name,
+            ]
+            result = await _run_one_test_with_forensics(
+                cmd, str(pd), run_env, name, recorder,
+            )
+            ok = result["success"]
+            timeout_note = ""
+            if result["kill_reason"]:
+                timeout_note = f" [{result['kill_reason']} after {result['elapsed_ms']}ms]"
+                ok = False
+            sections.append(
+                f"-- meson test {name} ({'clean' if ok else 'errors'}){timeout_note} --\n"
+                f"{result['captured']}"
+            )
+            findings.append({"node_id": name, "passed": ok})
+            overall_ok = overall_ok and ok
 
     log = "\n\n".join(sections)
-    header = "ANALYZE CLEAN ✓" if ok else "ANALYZE FOUND ISSUES ✗"
+    header = "ANALYZE CLEAN ✓" if overall_ok else "ANALYZE FOUND ISSUES ✗"
     summary = (
         f"tool={tool} backend=meson build_dir={build_dir} "
         f"tests={len(findings)} "
         f"clean={sum(1 for f in findings if f['passed'])} "
         f"with_errors={sum(1 for f in findings if not f['passed'])}"
     )
+    if scope:
+        summary += f" scope={scope!r}"
+
+    artifacts = _artifacts_section(recorder)
+
     ingest_payload = json.dumps({
         "summary": f"{header}\n{summary}",
         "findings": findings,
         "stdout": log[-12000:],
+        "artifacts": recorder.artifacts(),
     })
-    _report("analyze", {"project": project, "tool": tool}, ingest_payload, ok)
+    _report("analyze", {"project": project, "tool": tool, "scope": scope}, ingest_payload, overall_ok)
     tail = log[-2500:]
-    return f"{header}\n\n{summary}\n\n--- {tool} output (tail) ---\n{tail}"
+    return f"{header}\n\n{summary}\n\n{artifacts}\n--- {tool} output (tail) ---\n{tail}"
 
 
-async def _analyze_asan(project: str, pd: Path) -> str:
+async def _analyze_asan(project: str, pd: Path, scope: str = "") -> str:
     backend = _detect_backend(pd)
     if backend == "cmake":
         return await _analyze_sanitizer_cmake(
-            project, pd, "asan", ASAN_CFLAGS, ASAN_RUN_ENV,
+            project, pd, "asan", ASAN_CFLAGS, ASAN_RUN_ENV, scope=scope,
         )
     if backend == "meson":
         return await _analyze_sanitizer_meson(
-            project, pd, "asan", ASAN_CFLAGS, ASAN_RUN_ENV,
+            project, pd, "asan", ASAN_CFLAGS, ASAN_RUN_ENV, scope=scope,
         )
     if backend == "direct" and _gather_c_sources(pd):
-        return await _analyze_asan_direct(project, pd)
+        return await _analyze_asan_direct(project, pd, scope)
     result = (
         "ANALYZE FAILED ✗\n\n"
         "asan path supports cmake, meson, and direct-compile projects, but not "
         "make. For make projects, set CFLAGS='-fsanitize=address,undefined -g -O1' "
         "in your Makefile and use analyze(tool='valgrind') instead."
     )
-    _report("analyze", {"project": project, "tool": "asan"}, result, False)
+    _report("analyze", {"project": project, "tool": "asan", "scope": scope}, result, False)
     return result
 
 
-async def _analyze_asan_direct(project: str, pd: Path) -> str:
+async def _analyze_asan_direct(project: str, pd: Path, scope: str = "") -> str:
     sources = _gather_c_sources(pd)
     out_dir = pd / "build-asan"
     out_dir.mkdir(exist_ok=True)
@@ -815,35 +1372,58 @@ async def _analyze_asan_direct(project: str, pd: Path) -> str:
     ok, out = await _run_async(cmd, cwd=str(pd), env=deps_env or None)
     if not ok:
         result = f"ANALYZE FAILED ✗\n\n-- asan rebuild --\n{out}"
-        _report("analyze", {"project": project, "tool": "asan"}, result, False)
+        _report("analyze", {"project": project, "tool": "asan", "scope": scope}, result, False)
         return result
 
-    # Run the rebuilt binary; ASan exits non-zero on detection.
+    if scope and scope not in out_bin.name:
+        result = (
+            f"ANALYZE FAILED ✗\n\nscope={scope!r} did not match the rebuilt "
+            f"asan binary {out_bin.name!r}; direct-compile asan produces a single binary."
+        )
+        _report("analyze", {"project": project, "tool": "asan", "scope": scope}, result, False)
+        return result
+
+    # Run the rebuilt binary with forensics; ASan exits non-zero on detection.
     env = {**deps_env, **ASAN_RUN_ENV}
-    run_ok, run_out = await _run_async([str(out_bin)], cwd=str(pd), env=env)
-    log = f"-- asan rebuild --\n{out}\n\n-- asan run --\n{run_out}"
+    recorder = _ForensicsRecorder(pd, "asan")
+    run_cmd = ["stdbuf", "-o0", "-e0", str(out_bin)]
+    result = await _run_one_test_with_forensics(
+        run_cmd, str(pd), env, out_bin.name, recorder,
+    )
+    run_ok = result["success"]
+    timeout_note = ""
+    if result["kill_reason"]:
+        timeout_note = f" [{result['kill_reason']} after {result['elapsed_ms']}ms]"
+        run_ok = False
+    log = (
+        f"-- asan rebuild --\n{out}\n\n"
+        f"-- asan run ({'clean' if run_ok else 'errors'}){timeout_note} --\n{result['captured']}"
+    )
 
     header = "ANALYZE CLEAN ✓" if run_ok else "ANALYZE FOUND ISSUES ✗"
     findings = [{"node_id": out_bin.name, "passed": run_ok}]
     summary = f"tool=asan binary={out_bin.name} clean={run_ok}"
 
+    artifacts = _artifacts_section(recorder)
+
     ingest_payload = json.dumps({
         "summary": f"{header}\n{summary}",
         "findings": findings,
         "stdout": log[-12000:],
+        "artifacts": recorder.artifacts(),
     })
     _report(
         "analyze",
-        {"project": project, "tool": "asan"},
+        {"project": project, "tool": "asan", "scope": scope},
         ingest_payload,
         run_ok,
     )
 
     tail = log[-2500:]
-    return f"{header}\n\n{summary}\n\n--- asan output (tail) ---\n{tail}"
+    return f"{header}\n\n{summary}\n\n{artifacts}\n--- asan output (tail) ---\n{tail}"
 
 
-async def _analyze_tsan(project: str, pd: Path) -> str:
+async def _analyze_tsan(project: str, pd: Path, scope: str = "") -> str:
     backend = _detect_backend(pd)
     # TSan is incompatible with PIE under high-entropy ASLR ("unexpected memory
     # mapping") — disable PIE on test executables only. Shared libs must stay
@@ -861,15 +1441,17 @@ async def _analyze_tsan(project: str, pd: Path) -> str:
             exe_link_extra="-no-pie",
             extra_defines=["-DCMAKE_POSITION_INDEPENDENT_CODE=OFF"],
             test_wrapper=TSAN_RUN_WRAPPER,
+            scope=scope,
         )
     if backend == "meson":
         return await _analyze_sanitizer_meson(
             project, pd, "tsan", TSAN_CFLAGS, TSAN_RUN_ENV,
             extra_setup_args=["-Db_pie=false"],
             test_wrapper=TSAN_RUN_WRAPPER,
+            scope=scope,
         )
     if backend == "direct" and _gather_c_sources(pd):
-        return await _analyze_tsan_direct(project, pd)
+        return await _analyze_tsan_direct(project, pd, scope)
     result = (
         "ANALYZE FAILED ✗\n\n"
         "tsan path supports cmake, meson, and direct-compile projects, but not "
@@ -877,11 +1459,11 @@ async def _analyze_tsan(project: str, pd: Path) -> str:
         "CFLAGS='-fsanitize=thread,undefined -fno-omit-frame-pointer -g' "
         "in your Makefile and use analyze(tool='valgrind') instead."
     )
-    _report("analyze", {"project": project, "tool": "tsan"}, result, False)
+    _report("analyze", {"project": project, "tool": "tsan", "scope": scope}, result, False)
     return result
 
 
-async def _analyze_tsan_direct(project: str, pd: Path) -> str:
+async def _analyze_tsan_direct(project: str, pd: Path, scope: str = "") -> str:
     sources = _gather_c_sources(pd)
     test_sources = [s for s in sources if s.name.startswith("test_")]
     lib_sources = [s for s in sources if not s.name.startswith("test_")]
@@ -891,7 +1473,7 @@ async def _analyze_tsan_direct(project: str, pd: Path) -> str:
             "tsan path needs one or more test_*.c sources under src/ (or root) "
             "to build per-test binaries. None were found."
         )
-        _report("analyze", {"project": project, "tool": "tsan"}, result, False)
+        _report("analyze", {"project": project, "tool": "tsan", "scope": scope}, result, False)
         return result
 
     out_dir = pd / "build-tsan"
@@ -918,20 +1500,41 @@ async def _analyze_tsan_direct(project: str, pd: Path) -> str:
         if not ok:
             log = "\n\n".join(sections)
             result = f"ANALYZE FAILED ✗\n\n{log}"
-            _report("analyze", {"project": project, "tool": "tsan"}, result, False)
+            _report("analyze", {"project": project, "tool": "tsan", "scope": scope}, result, False)
             return result
         built_bins.append(out_bin)
 
-    # Run each rebuilt binary; TSan/UBSan exit non-zero on detection.
+    # Filter by scope after build (we still need to compile the libs).
+    run_bins = (
+        [b for b in built_bins if scope in b.name] if scope else built_bins
+    )
+    if not run_bins:
+        result = (
+            f"ANALYZE FAILED ✗\n\nscope={scope!r} matched none of: "
+            + ", ".join(b.name for b in built_bins)
+        )
+        _report("analyze", {"project": project, "tool": "tsan", "scope": scope}, result, False)
+        return result
+
+    # Run each rebuilt binary under forensics; TSan/UBSan exit non-zero
+    # on detection.
     env = {**deps_env, **TSAN_RUN_ENV}
+    recorder = _ForensicsRecorder(pd, "tsan")
     findings: list[dict] = []
     overall_ok = True
-    for b in built_bins:
-        run_ok, run_out = await _run_async(
-            [*TSAN_RUN_WRAPPER, str(b)], cwd=str(pd), env=env,
+    for b in run_bins:
+        cmd = [*TSAN_RUN_WRAPPER, "stdbuf", "-o0", "-e0", str(b)]
+        result = await _run_one_test_with_forensics(
+            cmd, str(pd), env, b.name, recorder,
         )
+        run_ok = result["success"]
+        timeout_note = ""
+        if result["kill_reason"]:
+            timeout_note = f" [{result['kill_reason']} after {result['elapsed_ms']}ms]"
+            run_ok = False
         sections.append(
-            f"-- tsan run {b.relative_to(pd)} ({'clean' if run_ok else 'errors'}) --\n{run_out}"
+            f"-- tsan run {b.relative_to(pd)} ({'clean' if run_ok else 'errors'}){timeout_note} --\n"
+            f"{result['captured']}"
         )
         findings.append({"node_id": b.name, "passed": run_ok})
         overall_ok = overall_ok and run_ok
@@ -939,25 +1542,30 @@ async def _analyze_tsan_direct(project: str, pd: Path) -> str:
     log = "\n\n".join(sections)
     header = "ANALYZE CLEAN ✓" if overall_ok else "ANALYZE FOUND ISSUES ✗"
     summary = (
-        f"tool=tsan binaries={len(built_bins)} "
+        f"tool=tsan binaries={len(run_bins)} "
         f"clean={sum(1 for f in findings if f['passed'])} "
         f"with_errors={sum(1 for f in findings if not f['passed'])}"
     )
+    if scope:
+        summary += f" scope={scope!r}"
+
+    artifacts = _artifacts_section(recorder)
 
     ingest_payload = json.dumps({
         "summary": f"{header}\n{summary}",
         "findings": findings,
         "stdout": log[-12000:],
+        "artifacts": recorder.artifacts(),
     })
     _report(
         "analyze",
-        {"project": project, "tool": "tsan"},
+        {"project": project, "tool": "tsan", "scope": scope},
         ingest_payload,
         overall_ok,
     )
 
     tail = log[-2500:]
-    return f"{header}\n\n{summary}\n\n--- tsan output (tail) ---\n{tail}"
+    return f"{header}\n\n{summary}\n\n{artifacts}\n--- tsan output (tail) ---\n{tail}"
 
 
 # ── install_dep helpers ───────────────────────────────────────────────────────

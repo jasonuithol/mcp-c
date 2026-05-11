@@ -38,7 +38,19 @@ Detail: `/workspace/docs/C_MCP.md`, `/workspace/docs/INGEST_MCP.md`.
 4. **Lint via `lint`.** Cheap, and failures get indexed.
 5. **For memory bugs, run `analyze`.** It runs the test binary under
    valgrind by default (or rebuilds with `-fsanitize=address` when
-   `tool="asan"`). Reports are indexed.
+   `tool="asan"`). Reports are indexed. The asan path runs tests with
+   `ASAN_OPTIONS=halt_on_error=1:verify_asan_link_order=0:handle_segv=0`:
+   - `verify_asan_link_order=0` so tests that dlopen non-instrumented
+     provider/plugin `.so`s don't bail with "ASan runtime does not come
+     first in initial library list" (tradeoff: ASan won't track allocs
+     from libs loaded before libasan).
+   - `handle_segv=0` so a genuine SIGSEGV in the test exits cleanly with
+     `rc=139` instead of getting stuck in libasan's recursive
+     DEADLYSIGNAL handler. Tradeoff: no ASan-printed stack on signal
+     crashes — debug those under gdb. Heap-overflow / use-after-free /
+     leak reports are unaffected (those don't go through the signal
+     handler).
+   See `/workspace/docs/C_MCP.md` for the full rationale.
 6. **For data races / lock-discipline bugs, run `analyze(tool="tsan")`.**
    Rebuilds the project under `-fsanitize=thread,undefined` into
    `build-tsan/` and runs the resulting tests with `TSAN_OPTIONS` /
@@ -57,6 +69,35 @@ Detail: `/workspace/docs/C_MCP.md`, `/workspace/docs/INGEST_MCP.md`.
    user to restart the container with
    `SECCOMP_PROFILE=$PWD/service/seccomp/tsan.json ./service/start-container.sh`
    — you can't do that yourself from inside the sandbox.
+
+## Forensics from analyze()
+
+Every `analyze()` invocation writes durable artifacts under
+`<project>/.forensics/<tool>/`:
+
+- `heartbeat.log` — fsync'd `START`/`END` line per test, with pid and
+  elapsed time. **If the host wedges mid-run, this is the first file to
+  read** — a `START` with no matching `END` tells you exactly which test
+  was in flight.
+- `output/<test>.log` — live, line-flushed, fsync'd capture of the test's
+  combined stdout+stderr (so output past the last libc flush isn't lost).
+- `snapshots/<test>.before.json` and `.after.json` — meminfo, loadavg,
+  process count, cgroup `memory.{current,max}` / `pids.{current,max}`.
+
+Under sanitizers, tests are run **serially with a per-test wall-clock
+timeout** (60s default; overridable via `MCP_C_TEST_TIMEOUT_S` on the
+container). On timeout the test's process group is sent `SIGABRT` (so
+ASan/TSan can dump state into `output/<test>.log`), then `SIGKILL` after
+a grace period (`MCP_C_TEST_ABORT_GRACE_S`, 5s default).
+
+Pass `scope=...` to `analyze` to sanitize-run a single test without
+inventing a workaround: regex for ctest, substring for meson / direct /
+valgrind.
+
+If the host crashes during an `analyze(tool=...)`, after reboot ask the
+host user to grab the kernel log from the dead boot
+(`journalctl -k -b -1`) — that lives in journald, not the container, so
+the service can't capture it.
 
 ## Project conventions
 
