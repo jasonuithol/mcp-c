@@ -20,8 +20,8 @@ Two services are registered. Use them — don't reinvent.
 - **c-build** (`build`, `run_tests`, `lint`, `analyze`, `install_dep`,
   `install_dep_source`, `remove_dep`, `list_deps`) — gcc 13 / clang
   toolchain with cmake, meson, make, valgrind, clang-tidy, cppcheck,
-  AddressSanitizer. `build` auto-detects the build system. Test, lint,
-  and analyze failures auto-ingest into c-knowledge.
+  AddressSanitizer, ThreadSanitizer. `build` auto-detects the build
+  system. Test, lint, and analyze failures auto-ingest into c-knowledge.
 
 Detail: `/workspace/docs/C_MCP.md`, `/workspace/docs/INGEST_MCP.md`.
 
@@ -39,6 +39,24 @@ Detail: `/workspace/docs/C_MCP.md`, `/workspace/docs/INGEST_MCP.md`.
 5. **For memory bugs, run `analyze`.** It runs the test binary under
    valgrind by default (or rebuilds with `-fsanitize=address` when
    `tool="asan"`). Reports are indexed.
+6. **For data races / lock-discipline bugs, run `analyze(tool="tsan")`.**
+   Rebuilds the project under `-fsanitize=thread,undefined` into
+   `build-tsan/` and runs the resulting tests with `TSAN_OPTIONS` /
+   `UBSAN_OPTIONS` halting on the first finding. Works for cmake, meson,
+   and direct-compile (cmake also gets `POSITION_INDEPENDENT_CODE=OFF`
+   and `-no-pie` on test executables; shared libs stay PIC). Reach for
+   this whenever you're touching mutexes, condvars, atomics, lock-free
+   queues, or anything else with concurrent shared state — TSan catches
+   races that mock-based unit tests will miss every time. Reports are
+   indexed.
+
+   **Caveat:** tsan needs the c-build container started under a relaxed
+   seccomp profile (TSan disables ASLR via the `personality()` syscall,
+   which the runtime default seccomp filters). If you see
+   `setarch: failed to set personality` in the test output, ask the host
+   user to restart the container with
+   `SECCOMP_PROFILE=$PWD/service/seccomp/tsan.json ./service/start-container.sh`
+   — you can't do that yourself from inside the sandbox.
 
 ## Project conventions
 
