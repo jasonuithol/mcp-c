@@ -39,7 +39,9 @@ Detail: `/workspace/docs/C_MCP.md`, `/workspace/docs/INGEST_MCP.md`.
 5. **For memory bugs, run `analyze`.** It runs the test binary under
    valgrind by default (or rebuilds with `-fsanitize=address` when
    `tool="asan"`). Reports are indexed. The asan path runs tests with
-   `ASAN_OPTIONS=halt_on_error=1:verify_asan_link_order=0:handle_segv=0`:
+   `ASAN_OPTIONS=halt_on_error=1:verify_asan_link_order=0:handle_segv=0`
+   plus `LD_BIND_NOW=1`, and links the build-asan/ binaries with
+   `-Wl,-z,now`:
    - `verify_asan_link_order=0` so tests that dlopen non-instrumented
      provider/plugin `.so`s don't bail with "ASan runtime does not come
      first in initial library list" (tradeoff: ASan won't track allocs
@@ -50,6 +52,11 @@ Detail: `/workspace/docs/C_MCP.md`, `/workspace/docs/INGEST_MCP.md`.
      crashes — call `debug(project, test)` to get a gdb backtrace for any
      specific crash. Heap-overflow / use-after-free / leak reports are
      unaffected (those don't go through the signal handler).
+   - `LD_BIND_NOW=1` + `-Wl,-z,now` so the loader resolves PLT entries
+     eagerly before libasan's init runs. Without this, libasan's init
+     constructor faults inside `_dl_fixup` → `do_lookup_x` resolving its
+     own `pthread_getspecific` slot, surfacing as a pre-`main()` SIGSEGV
+     with no useful stack. Applied to TSan builds too.
    See `/workspace/docs/C_MCP.md` for the full rationale.
 
    **For betl specifically**, prefer `analyze(tool="valgrind")` as the

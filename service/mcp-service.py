@@ -70,10 +70,27 @@ ASAN_CFLAGS = "-fsanitize=address,undefined -fno-omit-frame-pointer -g -O1"
 # also references libasan), which corrupted its state and produced the
 # same DEADLYSIGNAL loop. verify_asan_link_order=0 is the supported
 # workaround; LD_PRELOAD is not.
+#
+# LD_BIND_NOW=1 forces the dynamic loader to resolve all PLT slots
+# eagerly at startup, before user code (and before libasan's init
+# constructors) runs. Without it, libasan's own init touches a lazy
+# PLT slot (observed: pthread_getspecific) and the resolver
+# (_dl_fixup → do_lookup_x) faults on architectures/ld.so versions
+# that don't expect to be called from inside an ifunc/IFUNC-adjacent
+# init path. Surface: pre-main SIGSEGV in do_lookup_x with no useful
+# stack. Belt-and-braces: we also link sanitizer binaries with
+# -Wl,-z,now so the binary itself records DT_BIND_NOW and the env var
+# is only a fallback. Same fix is applied to TSan binaries.
 ASAN_RUN_ENV = {
     "ASAN_OPTIONS": "abort_on_error=1:halt_on_error=1:detect_leaks=1:verify_asan_link_order=0:handle_segv=0",
     "UBSAN_OPTIONS": "print_stacktrace=1:halt_on_error=1",
+    "LD_BIND_NOW": "1",
 }
+
+# Linker flag injected into sanitizer build paths so the resulting
+# binary is recorded with DT_BIND_NOW (eager PLT resolution). See the
+# LD_BIND_NOW comment above for the failure mode this prevents.
+SAN_NOW_LDFLAG = "-Wl,-z,now"
 
 # Sanitizer flags used by analyze(tool="tsan"). Thread + UB sanitizer, no -O level
 # pinned (TSan instrumentation works at any opt level; leave it to CFLAGS).
@@ -81,6 +98,10 @@ TSAN_CFLAGS = "-fsanitize=thread,undefined -fno-omit-frame-pointer -g"
 TSAN_RUN_ENV = {
     "TSAN_OPTIONS": "halt_on_error=1:second_deadlock_stack=1",
     "UBSAN_OPTIONS": "halt_on_error=1:print_stacktrace=1",
+    # Eager PLT resolution — see ASAN_RUN_ENV docstring for the lazy-PLT
+    # libasan-init race this prevents. TSan has the same init shape, so
+    # apply the same belt-and-braces here.
+    "LD_BIND_NOW": "1",
 }
 # Wrapping the test runner with `setarch <arch> -R` sets ADDR_NO_RANDOMIZE on
 # the runner's process personality; that bit is inherited by every child the
@@ -1132,12 +1153,13 @@ async def _analyze_sanitizer_cmake(
     deps_env = _deps_env(pd) or None
     sections: list[str] = []
 
-    exe_link_flags = f"{san_flags} {exe_link_extra}".strip()
+    exe_link_flags = f"{san_flags} {SAN_NOW_LDFLAG} {exe_link_extra}".strip()
+    shared_link_flags = f"{san_flags} {SAN_NOW_LDFLAG}".strip()
     cfg_cmd = [
         "cmake", "-S", ".", "-B", build_dir, "-G", "Ninja",
         f"-DCMAKE_C_FLAGS={san_flags}",
         f"-DCMAKE_EXE_LINKER_FLAGS={exe_link_flags}",
-        f"-DCMAKE_SHARED_LINKER_FLAGS={san_flags}",
+        f"-DCMAKE_SHARED_LINKER_FLAGS={shared_link_flags}",
         *(extra_defines or []),
     ]
     ok, out = await _run_async(cfg_cmd, cwd=str(pd), env=deps_env)
@@ -1287,11 +1309,12 @@ async def _analyze_sanitizer_meson(
     sections: list[str] = []
     flag_list = san_flags.split()
 
+    link_args = [*flag_list, SAN_NOW_LDFLAG]
     if not (out_dir / "build.ninja").exists():
         setup_cmd = [
             "meson", "setup", build_dir,
             f"-Dc_args={' '.join(flag_list)}",
-            f"-Dc_link_args={' '.join(flag_list)}",
+            f"-Dc_link_args={' '.join(link_args)}",
             *(extra_setup_args or []),
         ]
         ok, out = await _run_async(setup_cmd, cwd=str(pd), env=deps_env)
@@ -1416,6 +1439,7 @@ async def _analyze_asan_direct(project: str, pd: Path, scope: str = "") -> str:
     cmd = [
         CC, *CFLAGS.split(), *ASAN_CFLAGS.split(),
         *[str(s) for s in sources], "-o", str(out_bin),
+        SAN_NOW_LDFLAG,
     ]
     ok, out = await _run_async(cmd, cwd=str(pd), env=deps_env or None)
     if not ok:
@@ -1540,6 +1564,7 @@ async def _analyze_tsan_direct(project: str, pd: Path, scope: str = "") -> str:
             CC, *CFLAGS.split(), *TSAN_CFLAGS.split(),
             str(ts), *[str(s) for s in lib_sources],
             "-o", str(out_bin),
+            SAN_NOW_LDFLAG,
         ]
         if LDFLAGS:
             cmd += LDFLAGS.split()
