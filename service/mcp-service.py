@@ -512,13 +512,19 @@ async def _run_one_test_with_forensics(
 async def _enumerate_ctest_tests(pd: Path, build_dir: str, env: dict | None) -> list[dict]:
     """
     Return per-test metadata via ctest's --show-only=json-v1, as a list of
-    dicts: {"name": str, "command": list[str], "cwd": str, "env": dict[str,str]}.
+    dicts: {"name": str, "command": list[str], "cwd": str,
+            "env": dict[str,str], "will_fail": bool, "skip_rc": int | None}.
 
     We use the json-v1 surface (not `ctest -N`) so we get the actual test
     binary path and can execute it directly, bypassing ctest at run time.
     That isolation matters because ctest is not sanitizer-instrumented;
     pass deps_env only here (no sanitizer env) so an accidental future
     LD_PRELOAD or aggressive ASAN_OPTIONS setting can't crash ctest itself.
+
+    WILL_FAIL and SKIP_RETURN_CODE are surfaced because we run binaries
+    directly instead of via `ctest`, so ctest's pass/skip interpretation
+    isn't applied automatically — the caller must invert success or
+    classify a skip itself.
     """
     ok, out = await _run_async(
         ["ctest", "--test-dir", build_dir, "--show-only=json-v1"],
@@ -539,6 +545,8 @@ async def _enumerate_ctest_tests(pd: Path, build_dir: str, env: dict | None) -> 
             continue
         cwd = str(pd)
         env_kv: dict[str, str] = {}
+        will_fail = False
+        skip_rc: int | None = None
         for p in t.get("properties", []):
             pn = p.get("name")
             pv = p.get("value")
@@ -550,11 +558,25 @@ async def _enumerate_ctest_tests(pd: Path, build_dir: str, env: dict | None) -> 
                     if isinstance(item, str) and "=" in item:
                         k, _, v = item.partition("=")
                         env_kv[k] = v
+            elif pn == "WILL_FAIL":
+                # ctest stores this as a bool in json-v1, but be defensive
+                # against older variants that stringify it as "TRUE"/"ON".
+                if isinstance(pv, bool):
+                    will_fail = pv
+                elif isinstance(pv, str):
+                    will_fail = pv.strip().upper() in {"TRUE", "ON", "1", "YES"}
+            elif pn == "SKIP_RETURN_CODE":
+                try:
+                    skip_rc = int(pv)
+                except (TypeError, ValueError):
+                    skip_rc = None
         tests.append({
             "name": name,
             "command": list(command),
             "cwd": cwd,
             "env": env_kv,
+            "will_fail": will_fail,
+            "skip_rc": skip_rc,
         })
     return tests
 
@@ -1167,6 +1189,13 @@ async def _analyze_sanitizer_cmake(
     else:
         # Run each test's binary directly (bypassing ctest at execution).
         # Per-test ENVIRONMENT properties (from add_test) get merged in.
+        # We also honour the ctest test-property semantics ourselves:
+        #   - WILL_FAIL TRUE: invert the rc check (non-zero is a pass).
+        #   - SKIP_RETURN_CODE N: rc==N means "skipped", classified
+        #     separately from clean/errors.
+        # A timeout/kill is always a failure regardless of properties —
+        # WILL_FAIL is about the test's own non-zero exit, not our
+        # enforcement firing on a hang.
         base_run_env = {**(deps_env or {}), **san_env}
         for t in tests_meta:
             name = t["name"]
@@ -1179,25 +1208,40 @@ async def _analyze_sanitizer_cmake(
             result = await _run_one_test_with_forensics(
                 cmd, t["cwd"], test_env, name, recorder,
             )
-            ok = result["success"]
-            timeout_note = ""
-            if result["kill_reason"]:
-                timeout_note = f" [{result['kill_reason']} after {result['elapsed_ms']}ms]"
+            rc = result["rc"]
+            killed = result["kill_reason"]
+            timeout_note = f" [{killed} after {result['elapsed_ms']}ms]" if killed else ""
+
+            skipped = (t["skip_rc"] is not None and rc == t["skip_rc"] and not killed)
+            if skipped:
+                status = "skipped"
+                ok = True
+            elif killed:
+                status = "errors"
                 ok = False
+            elif t["will_fail"]:
+                ok = (rc != 0)
+                status = "clean (expected fail)" if ok else "errors (expected fail; passed instead)"
+            else:
+                ok = (rc == 0)
+                status = "clean" if ok else "errors"
+
             sections.append(
-                f"-- test {name} ({'clean' if ok else 'errors'}){timeout_note} --\n"
+                f"-- test {name} ({status}){timeout_note} --\n"
                 f"{result['captured']}"
             )
-            findings.append({"node_id": name, "passed": ok})
+            findings.append({"node_id": name, "passed": ok, "skipped": skipped})
             overall_ok = overall_ok and ok
 
     log = "\n\n".join(sections)
     header = "ANALYZE CLEAN ✓" if overall_ok else "ANALYZE FOUND ISSUES ✗"
+    n_skipped = sum(1 for f in findings if f.get("skipped"))
+    n_clean = sum(1 for f in findings if f["passed"] and not f.get("skipped"))
+    n_errors = sum(1 for f in findings if not f["passed"])
     summary = (
         f"tool={tool} backend=cmake build_dir={build_dir} "
         f"tests={len(findings)} "
-        f"clean={sum(1 for f in findings if f['passed'])} "
-        f"with_errors={sum(1 for f in findings if not f['passed'])}"
+        f"clean={n_clean} skipped={n_skipped} with_errors={n_errors}"
     )
     if scope:
         summary += f" scope={scope!r}"
