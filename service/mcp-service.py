@@ -15,6 +15,7 @@ import asyncio
 import hashlib
 import json
 import os
+import platform
 import re
 import shutil
 import subprocess
@@ -36,6 +37,30 @@ LDFLAGS = os.environ.get("LDFLAGS", "")
 
 # Sanitizer flags used by analyze(tool="asan").
 ASAN_CFLAGS = "-fsanitize=address,undefined -fno-omit-frame-pointer -g -O1"
+ASAN_RUN_ENV = {
+    "ASAN_OPTIONS": "abort_on_error=0:halt_on_error=0:detect_leaks=1",
+    "UBSAN_OPTIONS": "print_stacktrace=1:halt_on_error=0",
+}
+
+# Sanitizer flags used by analyze(tool="tsan"). Thread + UB sanitizer, no -O level
+# pinned (TSan instrumentation works at any opt level; leave it to CFLAGS).
+TSAN_CFLAGS = "-fsanitize=thread,undefined -fno-omit-frame-pointer -g"
+TSAN_RUN_ENV = {
+    "TSAN_OPTIONS": "halt_on_error=1:second_deadlock_stack=1",
+    "UBSAN_OPTIONS": "halt_on_error=1:print_stacktrace=1",
+}
+# Wrapping the test runner with `setarch <arch> -R` sets ADDR_NO_RANDOMIZE on
+# the runner's process personality; that bit is inherited by every child the
+# runner spawns (fork preserves it, execve doesn't clear it), so each test
+# binary runs without ASLR. Required because TSan's shadow memory mapping is
+# incompatible with high-entropy ASLR — without this, even non-PIE binaries
+# fail flakily with "FATAL: ThreadSanitizer: unexpected memory mapping" as the
+# loader's randomised library placement collides with TSan's reserved range.
+# Requires the personality() syscall, which the container runtime's default
+# seccomp profile filters with ENOSYS — start-container.sh accepts an optional
+# $SECCOMP_PROFILE pointing at service/seccomp/tsan.json (or a project-specific
+# profile) to relax that.
+TSAN_RUN_WRAPPER = ["setarch", platform.machine(), "-R"]
 
 # ── Knowledge reporter ────────────────────────────────────────────────────────
 
@@ -271,9 +296,9 @@ def _parse_ctest(log: str) -> list[dict]:
     return tests
 
 
-def _parse_meson(pd: Path) -> list[dict]:
+def _parse_meson(pd: Path, build_dir: str = "build") -> list[dict]:
     """Read meson's machine-readable testlog.json if present."""
-    log_path = pd / "build" / "meson-logs" / "testlog.json"
+    log_path = pd / build_dir / "meson-logs" / "testlog.json"
     if not log_path.exists():
         return []
     tests = []
@@ -499,14 +524,36 @@ async def analyze(project: str, tool: str = "valgrind") -> str:
         valgrind --leak-check=full --error-exitcode=23. Use the existing
         build — no recompile.
 
-    tool="asan": rebuild the project with -fsanitize=address,undefined
-        (writes into build-asan/), then run the resulting test binaries.
-        Only supported for the direct-compile path right now; for cmake
-        / meson / make you would set CFLAGS in the project's build files.
+    tool="asan": rebuild with -fsanitize=address,undefined into build-asan/
+        and run the resulting test binaries.
+          - direct: compiles all sources into one build-asan/<project>-asan.
+          - cmake:  configures build-asan/ with -DCMAKE_C_FLAGS injecting
+                    the sanitizer, builds, then runs ctest.
+          - meson:  sets up build-asan/ with c_args/c_link_args injecting
+                    the sanitizer, compiles, then runs meson test.
+          - make:   not supported (Makefiles vary too much to inject
+                    sanitizer flags reliably; set CFLAGS in your Makefile).
+
+    tool="tsan": same backend matrix as asan, but with
+        -fsanitize=thread,undefined and TSAN_OPTIONS/UBSAN_OPTIONS set to
+        halt on the first finding. Direct mode builds one binary per
+        test_*.c into build-tsan/test_* and runs each.
+
+        Test runners are wrapped with `setarch -R` to disable ASLR for the
+        test process tree (TSan's shadow memory mapping can't coexist with
+        high-entropy ASLR). That requires the personality() syscall, which
+        the container runtime's default seccomp profile filters with ENOSYS.
+        Restart the c-mcp-build container under a relaxed profile before
+        running tsan analyses:
+            docker rm -f c-mcp-build
+            SECCOMP_PROFILE=$PWD/service/seccomp/tsan.json \\
+                ./service/start-container.sh
+        Symptom of forgetting this step: every test fails with
+        "setarch: failed to set personality" in the test output.
 
     Args:
         project: Folder name under ~/Projects.
-        tool:    'valgrind' or 'asan'.
+        tool:    'valgrind', 'asan', or 'tsan'.
     """
     try:
         pd = _project_dir(project)
@@ -519,7 +566,9 @@ async def analyze(project: str, tool: str = "valgrind") -> str:
         return await _analyze_valgrind(project, pd)
     if tool == "asan":
         return await _analyze_asan(project, pd)
-    result = f"ANALYZE FAILED ✗\n\nUnknown tool {tool!r}. Use 'valgrind' or 'asan'."
+    if tool == "tsan":
+        return await _analyze_tsan(project, pd)
+    result = f"ANALYZE FAILED ✗\n\nUnknown tool {tool!r}. Use 'valgrind', 'asan', or 'tsan'."
     _report("analyze", {"project": project, "tool": tool}, result, False)
     return result
 
@@ -577,21 +626,183 @@ async def _analyze_valgrind(project: str, pd: Path) -> str:
     return f"{header}\n\n{summary}\n\n--- valgrind output (tail) ---\n{tail}"
 
 
-async def _analyze_asan(project: str, pd: Path) -> str:
-    sources = _gather_c_sources(pd)
-    backend = _detect_backend(pd)
-    if backend != "direct" or not sources:
-        result = (
-            "ANALYZE FAILED ✗\n\n"
-            "asan path currently only supports direct-compile projects "
-            "(no CMakeLists.txt / meson.build / Makefile, plus *.c sources). "
-            "For cmake/meson/make projects, set "
-            "CFLAGS='-fsanitize=address,undefined -g -O1' in your build files "
-            "and use analyze(tool='valgrind') instead."
-        )
-        _report("analyze", {"project": project, "tool": "asan"}, result, False)
+async def _analyze_sanitizer_cmake(
+    project: str,
+    pd: Path,
+    tool: str,
+    san_flags: str,
+    san_env: dict[str, str],
+    exe_link_extra: str = "",
+    extra_defines: list[str] | None = None,
+    test_wrapper: list[str] | None = None,
+) -> str:
+    """Configure build-{tool}/ with sanitizer flags injected via CMAKE_C_FLAGS,
+    build, then run ctest with the sanitizer's runtime env vars set.
+    Each invocation reconfigures (idempotent — cmake re-applies -D values),
+    so switching between asan and tsan never sees stale cache state because
+    they use disjoint build directories.
+
+    exe_link_extra is appended to CMAKE_EXE_LINKER_FLAGS only (not the shared
+    one) — that's the slot for things like -no-pie which executables need but
+    shared libs must not see (they require -fPIC and -no-pie would break them).
+
+    extra_defines are appended to the cmake configure line (e.g.
+    "-DCMAKE_POSITION_INDEPENDENT_CODE=OFF" for tsan, which stops cmake from
+    emitting -pie per-target — that override would otherwise win against any
+    -no-pie we put in CMAKE_EXE_LINKER_FLAGS because of link-line ordering)."""
+    build_dir = f"build-{tool}"
+    out_dir = pd / build_dir
+    deps_env = _deps_env(pd) or None
+    sections: list[str] = []
+
+    exe_link_flags = f"{san_flags} {exe_link_extra}".strip()
+    cfg_cmd = [
+        "cmake", "-S", ".", "-B", build_dir, "-G", "Ninja",
+        f"-DCMAKE_C_FLAGS={san_flags}",
+        f"-DCMAKE_EXE_LINKER_FLAGS={exe_link_flags}",
+        f"-DCMAKE_SHARED_LINKER_FLAGS={san_flags}",
+        *(extra_defines or []),
+    ]
+    ok, out = await _run_async(cfg_cmd, cwd=str(pd), env=deps_env)
+    sections.append(f"-- cmake configure ({'ok' if ok else 'failed'}) --\n{out}")
+    if not ok:
+        result = f"ANALYZE FAILED ✗\n\n" + "\n\n".join(sections)
+        _report("analyze", {"project": project, "tool": tool}, result, False)
         return result
 
+    ok, out = await _run_async(
+        ["cmake", "--build", build_dir], cwd=str(pd), env=deps_env,
+    )
+    sections.append(f"-- cmake build ({'ok' if ok else 'failed'}) --\n{out}")
+    if not ok:
+        result = f"ANALYZE FAILED ✗\n\n" + "\n\n".join(sections)
+        _report("analyze", {"project": project, "tool": tool}, result, False)
+        return result
+
+    run_env = {**(deps_env or {}), **san_env}
+    ctest_cmd = [
+        *(test_wrapper or []),
+        "ctest", "--test-dir", build_dir, "--output-on-failure",
+    ]
+    ok, out = await _run_async(ctest_cmd, cwd=str(pd), env=run_env)
+    sections.append(f"-- ctest ({'clean' if ok else 'errors'}) --\n{out}")
+    findings = _parse_ctest(out) or [{"node_id": f"ctest-{tool}", "passed": ok}]
+
+    log = "\n\n".join(sections)
+    header = "ANALYZE CLEAN ✓" if ok else "ANALYZE FOUND ISSUES ✗"
+    summary = (
+        f"tool={tool} backend=cmake build_dir={build_dir} "
+        f"tests={len(findings)} "
+        f"clean={sum(1 for f in findings if f['passed'])} "
+        f"with_errors={sum(1 for f in findings if not f['passed'])}"
+    )
+    ingest_payload = json.dumps({
+        "summary": f"{header}\n{summary}",
+        "findings": findings,
+        "stdout": log[-12000:],
+    })
+    _report("analyze", {"project": project, "tool": tool}, ingest_payload, ok)
+    tail = log[-2500:]
+    return f"{header}\n\n{summary}\n\n--- {tool} output (tail) ---\n{tail}"
+
+
+async def _analyze_sanitizer_meson(
+    project: str,
+    pd: Path,
+    tool: str,
+    san_flags: str,
+    san_env: dict[str, str],
+    extra_setup_args: list[str] | None = None,
+    test_wrapper: list[str] | None = None,
+) -> str:
+    """Set up build-{tool}/ with sanitizer flags injected via c_args/c_link_args
+    (meson's b_sanitize accepts only a fixed set of values, so the explicit
+    args route is what works for every flag combo we care about), compile,
+    then run meson test with the sanitizer's runtime env vars set.
+
+    extra_setup_args is appended to the `meson setup` invocation — used by
+    tsan to pass -Db_pie=false (TSan + PIE + high-entropy ASLR is incompatible;
+    b_pie scopes the disable to executables and leaves shared libs PIC)."""
+    build_dir = f"build-{tool}"
+    out_dir = pd / build_dir
+    deps_env = _deps_env(pd) or None
+    sections: list[str] = []
+    flag_list = san_flags.split()
+
+    if not (out_dir / "build.ninja").exists():
+        setup_cmd = [
+            "meson", "setup", build_dir,
+            f"-Dc_args={' '.join(flag_list)}",
+            f"-Dc_link_args={' '.join(flag_list)}",
+            *(extra_setup_args or []),
+        ]
+        ok, out = await _run_async(setup_cmd, cwd=str(pd), env=deps_env)
+        sections.append(f"-- meson setup ({'ok' if ok else 'failed'}) --\n{out}")
+        if not ok:
+            result = f"ANALYZE FAILED ✗\n\n" + "\n\n".join(sections)
+            _report("analyze", {"project": project, "tool": tool}, result, False)
+            return result
+
+    ok, out = await _run_async(
+        ["meson", "compile", "-C", build_dir], cwd=str(pd), env=deps_env,
+    )
+    sections.append(f"-- meson compile ({'ok' if ok else 'failed'}) --\n{out}")
+    if not ok:
+        result = f"ANALYZE FAILED ✗\n\n" + "\n\n".join(sections)
+        _report("analyze", {"project": project, "tool": tool}, result, False)
+        return result
+
+    run_env = {**(deps_env or {}), **san_env}
+    test_cmd = [
+        *(test_wrapper or []),
+        "meson", "test", "-C", build_dir, "--print-errorlogs",
+    ]
+    ok, out = await _run_async(test_cmd, cwd=str(pd), env=run_env)
+    sections.append(f"-- meson test ({'clean' if ok else 'errors'}) --\n{out}")
+    findings = _parse_meson(pd, build_dir) or [{"node_id": f"meson-test-{tool}", "passed": ok}]
+
+    log = "\n\n".join(sections)
+    header = "ANALYZE CLEAN ✓" if ok else "ANALYZE FOUND ISSUES ✗"
+    summary = (
+        f"tool={tool} backend=meson build_dir={build_dir} "
+        f"tests={len(findings)} "
+        f"clean={sum(1 for f in findings if f['passed'])} "
+        f"with_errors={sum(1 for f in findings if not f['passed'])}"
+    )
+    ingest_payload = json.dumps({
+        "summary": f"{header}\n{summary}",
+        "findings": findings,
+        "stdout": log[-12000:],
+    })
+    _report("analyze", {"project": project, "tool": tool}, ingest_payload, ok)
+    tail = log[-2500:]
+    return f"{header}\n\n{summary}\n\n--- {tool} output (tail) ---\n{tail}"
+
+
+async def _analyze_asan(project: str, pd: Path) -> str:
+    backend = _detect_backend(pd)
+    if backend == "cmake":
+        return await _analyze_sanitizer_cmake(
+            project, pd, "asan", ASAN_CFLAGS, ASAN_RUN_ENV,
+        )
+    if backend == "meson":
+        return await _analyze_sanitizer_meson(
+            project, pd, "asan", ASAN_CFLAGS, ASAN_RUN_ENV,
+        )
+    if backend == "direct" and _gather_c_sources(pd):
+        return await _analyze_asan_direct(project, pd)
+    result = (
+        "ANALYZE FAILED ✗\n\n"
+        "asan path supports cmake, meson, and direct-compile projects, but not "
+        "make. For make projects, set CFLAGS='-fsanitize=address,undefined -g -O1' "
+        "in your Makefile and use analyze(tool='valgrind') instead."
+    )
+    _report("analyze", {"project": project, "tool": "asan"}, result, False)
+    return result
+
+
+async def _analyze_asan_direct(project: str, pd: Path) -> str:
+    sources = _gather_c_sources(pd)
     out_dir = pd / "build-asan"
     out_dir.mkdir(exist_ok=True)
     out_bin = out_dir / f"{project}-asan"
@@ -608,11 +819,7 @@ async def _analyze_asan(project: str, pd: Path) -> str:
         return result
 
     # Run the rebuilt binary; ASan exits non-zero on detection.
-    env = {
-        **deps_env,
-        "ASAN_OPTIONS": "abort_on_error=0:halt_on_error=0:detect_leaks=1",
-        "UBSAN_OPTIONS": "print_stacktrace=1:halt_on_error=0",
-    }
+    env = {**deps_env, **ASAN_RUN_ENV}
     run_ok, run_out = await _run_async([str(out_bin)], cwd=str(pd), env=env)
     log = f"-- asan rebuild --\n{out}\n\n-- asan run --\n{run_out}"
 
@@ -634,6 +841,123 @@ async def _analyze_asan(project: str, pd: Path) -> str:
 
     tail = log[-2500:]
     return f"{header}\n\n{summary}\n\n--- asan output (tail) ---\n{tail}"
+
+
+async def _analyze_tsan(project: str, pd: Path) -> str:
+    backend = _detect_backend(pd)
+    # TSan is incompatible with PIE under high-entropy ASLR ("unexpected memory
+    # mapping") — disable PIE on test executables only. Shared libs must stay
+    # PIC, so we don't touch CMAKE_SHARED_LINKER_FLAGS / c_link_args directly.
+    # For cmake we need both knobs:
+    #   POSITION_INDEPENDENT_CODE=OFF stops cmake's per-target machinery from
+    #     appending -pie to executable link lines (which would override -no-pie
+    #     due to link-line ordering). Static archives don't need PIC; shared
+    #     libs are forced-PIC by cmake regardless of this variable.
+    #   -no-pie is belt-and-suspenders for projects that hardcode -pie via
+    #     target_link_options or similar per-target overrides.
+    if backend == "cmake":
+        return await _analyze_sanitizer_cmake(
+            project, pd, "tsan", TSAN_CFLAGS, TSAN_RUN_ENV,
+            exe_link_extra="-no-pie",
+            extra_defines=["-DCMAKE_POSITION_INDEPENDENT_CODE=OFF"],
+            test_wrapper=TSAN_RUN_WRAPPER,
+        )
+    if backend == "meson":
+        return await _analyze_sanitizer_meson(
+            project, pd, "tsan", TSAN_CFLAGS, TSAN_RUN_ENV,
+            extra_setup_args=["-Db_pie=false"],
+            test_wrapper=TSAN_RUN_WRAPPER,
+        )
+    if backend == "direct" and _gather_c_sources(pd):
+        return await _analyze_tsan_direct(project, pd)
+    result = (
+        "ANALYZE FAILED ✗\n\n"
+        "tsan path supports cmake, meson, and direct-compile projects, but not "
+        "make. For make projects, set "
+        "CFLAGS='-fsanitize=thread,undefined -fno-omit-frame-pointer -g' "
+        "in your Makefile and use analyze(tool='valgrind') instead."
+    )
+    _report("analyze", {"project": project, "tool": "tsan"}, result, False)
+    return result
+
+
+async def _analyze_tsan_direct(project: str, pd: Path) -> str:
+    sources = _gather_c_sources(pd)
+    test_sources = [s for s in sources if s.name.startswith("test_")]
+    lib_sources = [s for s in sources if not s.name.startswith("test_")]
+    if not test_sources:
+        result = (
+            "ANALYZE FAILED ✗\n\n"
+            "tsan path needs one or more test_*.c sources under src/ (or root) "
+            "to build per-test binaries. None were found."
+        )
+        _report("analyze", {"project": project, "tool": "tsan"}, result, False)
+        return result
+
+    out_dir = pd / "build-tsan"
+    out_dir.mkdir(exist_ok=True)
+    deps_env = _deps_env(pd)
+
+    sections: list[str] = []
+    built_bins: list[Path] = []
+
+    # Compile each test_*.c into its own build-tsan/<basename> binary, linking
+    # in the non-test sources. Stop on first compile failure — partial builds
+    # would just produce confusing run results.
+    for ts in test_sources:
+        out_bin = out_dir / ts.stem
+        cmd = [
+            CC, *CFLAGS.split(), *TSAN_CFLAGS.split(),
+            str(ts), *[str(s) for s in lib_sources],
+            "-o", str(out_bin),
+        ]
+        if LDFLAGS:
+            cmd += LDFLAGS.split()
+        ok, out = await _run_async(cmd, cwd=str(pd), env=deps_env or None)
+        sections.append(f"-- tsan rebuild {ts.relative_to(pd)} ({'ok' if ok else 'failed'}) --\n{out}")
+        if not ok:
+            log = "\n\n".join(sections)
+            result = f"ANALYZE FAILED ✗\n\n{log}"
+            _report("analyze", {"project": project, "tool": "tsan"}, result, False)
+            return result
+        built_bins.append(out_bin)
+
+    # Run each rebuilt binary; TSan/UBSan exit non-zero on detection.
+    env = {**deps_env, **TSAN_RUN_ENV}
+    findings: list[dict] = []
+    overall_ok = True
+    for b in built_bins:
+        run_ok, run_out = await _run_async(
+            [*TSAN_RUN_WRAPPER, str(b)], cwd=str(pd), env=env,
+        )
+        sections.append(
+            f"-- tsan run {b.relative_to(pd)} ({'clean' if run_ok else 'errors'}) --\n{run_out}"
+        )
+        findings.append({"node_id": b.name, "passed": run_ok})
+        overall_ok = overall_ok and run_ok
+
+    log = "\n\n".join(sections)
+    header = "ANALYZE CLEAN ✓" if overall_ok else "ANALYZE FOUND ISSUES ✗"
+    summary = (
+        f"tool=tsan binaries={len(built_bins)} "
+        f"clean={sum(1 for f in findings if f['passed'])} "
+        f"with_errors={sum(1 for f in findings if not f['passed'])}"
+    )
+
+    ingest_payload = json.dumps({
+        "summary": f"{header}\n{summary}",
+        "findings": findings,
+        "stdout": log[-12000:],
+    })
+    _report(
+        "analyze",
+        {"project": project, "tool": "tsan"},
+        ingest_payload,
+        overall_ok,
+    )
+
+    tail = log[-2500:]
+    return f"{header}\n\n{summary}\n\n--- tsan output (tail) ---\n{tail}"
 
 
 # ── install_dep helpers ───────────────────────────────────────────────────────
